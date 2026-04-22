@@ -3,8 +3,8 @@
 Morning Briefing Bot — Groq + NewsData.io Edition (100% Free)
 - NewsData.io free tier   → fetches real current news (200 req/day free)
 - Groq free tier (Llama)  → picks top 5 and formats each section
-- Telegraph               → publishes full beautiful briefing page
-- Telegram                → sends clean HTML summary with Telegraph link
+- Telegraph               → each article gets its own Telegraph page (Instant View)
+- Telegram                → clean HTML summary; all links open as Instant View
 """
 
 import os
@@ -45,12 +45,12 @@ def call_groq(prompt: str, retries: int = 3) -> str:
             }
         ],
         "temperature": 0.1,
-        "max_tokens":  1024,   # kept low to stay within 6000 TPM free limit
+        "max_tokens":  1024,
     }
     for attempt in range(retries):
         resp = requests.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=60)
         if resp.status_code == 429:
-            wait = 15 * (attempt + 1)   # 15s, 30s, 45s
+            wait = 15 * (attempt + 1)
             print(f"   ⏳ Rate limited — waiting {wait}s (retry {attempt+1}/{retries})...")
             time.sleep(wait)
             continue
@@ -67,7 +67,6 @@ def call_groq(prompt: str, retries: int = 3) -> str:
 # ── NewsData.io helpers ────────────────────────────────────────────────────────
 
 SECTION_QUERIES = {
-    # category filter removed — combining q+category causes 0 results on free tier
     "security": {
         "q":        "vulnerability security CVE patch exploit malware",
         "language": "en",
@@ -112,15 +111,15 @@ def fetch_news(section: str) -> list:
         print(f"   ⚠️  NewsData error [{resp.status_code}]: {resp.text[:300]}")
         return []
 
-    body     = resp.json()
+    body = resp.json()
     if body.get("status") != "success":
-        print(f"   ⚠️  NewsData non-success: {body.get('results', body)}")
+        print(f"   ⚠️  NewsData non-success: {str(body)[:300]}")
         return []
     articles = body.get("results", [])
     print(f"   → API returned {len(articles)} raw results")
     return [
         {
-            "title": a.get("title", "").strip()[:120],   # short title only — keeps tokens low
+            "title": a.get("title", "").strip()[:120],
             "url":   a.get("link", ""),
         }
         for a in articles
@@ -146,7 +145,6 @@ def curate_with_groq(section: str, articles: list, date_str: str) -> list:
     severity_field = ', "severity": "High"' if needs_severity else ""
     severity_note  = 'Add "severity": Critical/High/Medium/Low for each item.' if needs_severity else ""
 
-    # Build compact article list string (minimise tokens)
     articles_text = "\n".join(
         f"{i+1}. {a['title']} | {a['url']}"
         for i, a in enumerate(articles)
@@ -166,12 +164,10 @@ Return ONLY a JSON array, no markdown:
     raw  = call_groq(prompt)
     text = raw.strip()
 
-    # Strip accidental markdown fences
     if "```" in text:
         lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
         text  = "\n".join(lines).strip()
 
-    # Extract JSON array
     start = text.find("[")
     end   = text.rfind("]") + 1
     if start != -1 and end > start:
@@ -182,7 +178,6 @@ Return ONLY a JSON array, no markdown:
         return items[:5]
     except json.JSONDecodeError as e:
         print(f"   ⚠️  JSON parse error for '{section}': {e}")
-        # Graceful fallback
         return [
             {"headline": a["title"][:80], "url": a["url"], "detail": ""}
             for a in articles[:5]
@@ -212,6 +207,7 @@ def get_telegraph_token() -> str:
 
 
 def publish_to_telegraph(token: str, title: str, nodes: list) -> str:
+    """Publish a Telegraph page and return its URL."""
     resp = requests.post("https://api.telegra.ph/createPage", json={
         "access_token":   token,
         "title":          title,
@@ -226,43 +222,165 @@ def publish_to_telegraph(token: str, title: str, nodes: list) -> str:
     return result["result"]["url"]
 
 
-def build_telegraph_nodes(sections: dict, date_str: str) -> list:
-    SECTION_LABELS = {
-        "security":      "🔐 Security & Vulnerabilities",
-        "tech":          "💻 Global Tech News",
-        "world":         "🌍 World Politics",
-        "grc":           "📋 GRC & Compliance",
-        "entertainment": "🎬 Entertainment",
-        "india":         "🇮🇳 India & Kerala",
+def publish_article_to_telegraph(token: str, item: dict, section_label: str) -> str:
+    """
+    Publish a single news item as its own Telegraph page.
+    Clean article card layout — opens as Instant View in Telegram.
+    """
+    headline = item.get("headline", "Untitled")
+    detail   = item.get("detail", "")
+    src_url  = item.get("url", "")
+    severity = item.get("severity", "")
+
+    SEVERITY_BARS = {
+        "Critical": "🔴 CRITICAL — Patch immediately",
+        "High":     "🟠 HIGH — Action recommended",
+        "Medium":   "🟡 MEDIUM — Monitor closely",
+        "Low":      "🟢 LOW — Informational",
     }
+
+    nodes = []
+
+    # Section tag
+    nodes.append({"tag": "p", "children": [
+        {"tag": "em", "children": [f"Morning Briefing  ·  {section_label}"]}
+    ]})
+
+    nodes.append({"tag": "p", "children": ["▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"]})
+
+    # Severity badge
+    if severity:
+        sev_text = SEVERITY_BARS.get(severity, f"⚪ {severity.upper()}")
+        nodes.append({"tag": "p", "children": [
+            {"tag": "b", "children": [sev_text]}
+        ]})
+
+    # Summary as blockquote
+    if detail:
+        nodes.append({"tag": "blockquote", "children": [detail]})
+
+    nodes.append({"tag": "p", "children": [" "]})
+    nodes.append({"tag": "p", "children": ["▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"]})
+
+    # Source link
+    if src_url:
+        nodes.append({"tag": "p", "children": [
+            "📰  Read the full story:  ",
+            {"tag": "a", "attrs": {"href": src_url}, "children": [src_url[:60] + "..." if len(src_url) > 60 else src_url]}
+        ]})
+
+    nodes.append({"tag": "p", "children": [" "]})
+    nodes.append({"tag": "p", "children": [
+        {"tag": "em", "children": ["Part of the Morning Briefing newsletter · Powered by Groq + NewsData.io"]}
+    ]})
+
+    return publish_to_telegraph(token, headline, nodes)
+
+
+def build_main_telegraph_page(sections: dict, date_str: str, token: str) -> str:
+    """
+    Build the main newsletter-style daily briefing Telegraph page.
+    Beautiful layout with section headers, blockquotes, severity badges.
+    Every article link opens its own Telegraph Instant View page.
+    """
+    SECTION_META = {
+        "security":      ("🔐", "Security & Vulnerabilities",  "Threats, CVEs and patches for your devices."),
+        "tech":          ("💻", "Global Tech News",             "Under-reported developments in AI, hardware and open source."),
+        "world":         ("🌍", "World Politics",               "Geopolitical shifts beyond the mainstream headlines."),
+        "grc":           ("📋", "GRC & Compliance",             "Regulatory updates, enforcement actions and compliance deadlines."),
+        "entertainment": ("🎬", "Entertainment",                "OTT, Malayalam & Indian cinema, global film and music."),
+        "india":         ("🇮🇳", "India & Kerala",              "Top stories from India and Kerala."),
+    }
+
+    SEVERITY_BARS = {
+        "Critical": "🔴 CRITICAL",
+        "High":     "🟠 HIGH",
+        "Medium":   "🟡 MEDIUM",
+        "Low":      "🟢 LOW",
+    }
+
+    # ── Header ────────────────────────────────────────────────────────────────
     nodes = [
-        {"tag": "p", "children": [{"tag": "em", "children": [f"Daily intelligence briefing — {date_str}"]}]},
-        {"tag": "p", "children": ["─────────────────────────"]},
+        {"tag": "p", "children": [
+            {"tag": "b", "children": ["MORNING BRIEFING"]}
+        ]},
+        {"tag": "p", "children": [
+            {"tag": "em", "children": [f"📅  {date_str}"]}
+        ]},
+        {"tag": "p", "children": ["Your daily intelligence digest — curated and summarised."]},
+        {"tag": "p", "children": ["▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"]},
+        {"tag": "p", "children": [" "]},
     ]
+
+    # ── Sections ──────────────────────────────────────────────────────────────
     for key, items in sections.items():
         if not items:
             continue
-        nodes.append({"tag": "h3", "children": [SECTION_LABELS.get(key, key)]})
-        for idx, item in enumerate(items, 1):
-            headline = item.get("headline", "Untitled")
-            url      = item.get("url", "")
-            detail   = item.get("detail", "")
-            severity = item.get("severity", "")
-            link     = {"tag": "a", "attrs": {"href": url}, "children": [headline]} if url else headline
-            children = [f"{idx}. ", link]
-            if severity:
-                children += [{"tag": "b", "children": [f" [{severity}]"]}]
-            if detail:
-                children += [f" — {detail}"]
-            nodes.append({"tag": "p", "children": children})
+
+        emoji, label, intro = SECTION_META.get(key, ("📌", key, ""))
+
+        # Section header
+        nodes.append({"tag": "h3", "children": [f"{emoji}  {label}"]})
+
+        # Section intro line
+        if intro:
+            nodes.append({"tag": "p", "children": [
+                {"tag": "em", "children": [intro]}
+            ]})
+
         nodes.append({"tag": "p", "children": [" "]})
+
+        # Each article as a blockquote card
+        for item in items:
+            headline  = item.get("headline", "Untitled")
+            detail    = item.get("detail", "")
+            severity  = item.get("severity", "")
+            tele_url  = item.get("telegraph_url", item.get("url", ""))
+
+            card_children = []
+
+            # Severity badge on its own line for security items
+            if severity:
+                sev_label = SEVERITY_BARS.get(severity, f"⚪ {severity.upper()}")
+                card_children.append({"tag": "b", "children": [sev_label]})
+                card_children.append(" | ")
+
+            # Headline as bold link
+            if tele_url:
+                card_children.append({
+                    "tag": "a",
+                    "attrs": {"href": tele_url},
+                    "children": [{"tag": "b", "children": [headline]}]
+                })
+            else:
+                card_children.append({"tag": "b", "children": [headline]})
+
+            # Detail line
+            if detail:
+                card_children.append(" | ")
+                card_children.append(detail)
+
+            nodes.append({"tag": "blockquote", "children": card_children})
+            nodes.append({"tag": "p", "children": [" "]})
+
+        # Section divider
+        nodes.append({"tag": "p", "children": ["· · · · · · · · · · · · · · · · · · ·"]})
+        nodes.append({"tag": "p", "children": [" "]})
+
+    # ── Footer ────────────────────────────────────────────────────────────────
     nodes += [
-        {"tag": "p", "children": ["─────────────────────────"]},
-        {"tag": "p", "children": [{"tag": "em", "children": [
-            f"Generated by Morning Briefing Bot (Groq Llama + NewsData.io) • {date_str}"
-        ]}]},
+        {"tag": "p", "children": ["▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"]},
+        {"tag": "p", "children": [
+            {"tag": "em", "children": [
+                f"Generated automatically • Groq Llama + NewsData.io • {date_str}"
+            ]}
+        ]},
+        {"tag": "p", "children": [
+            {"tag": "em", "children": ["Tap any headline above to read the full story in Instant View."]}
+        ]},
     ]
-    return nodes
+
+    return publish_to_telegraph(token, f"📰 Morning Briefing — {date_str}", nodes)
 
 
 # ── Telegram helpers ───────────────────────────────────────────────────────────
@@ -286,14 +404,18 @@ def send_telegram(text: str):
             "chat_id":                  TELEGRAM_CHAT_ID,
             "text":                     chunk,
             "parse_mode":               "HTML",
-            "disable_web_page_preview": True,
+            "disable_web_page_preview": False,   # allow Telegraph previews
         }, timeout=10)
         print(f"✅ Telegram chunk {i+1}/{len(chunks)} sent" if resp.ok else f"⚠️  Telegram error: {resp.text}")
         if len(chunks) > 1:
             time.sleep(0.5)
 
 
-def build_telegram_summary(sections: dict, telegraph_url: str, date_str: str) -> str:
+def build_telegram_summary(sections: dict, main_telegraph_url: str, date_str: str) -> str:
+    """
+    Build Telegram HTML summary.
+    Every bullet links to its own telegra.ph page → opens as Instant View.
+    """
     HEADERS = {
         "security":      "🔐 <b>Security &amp; Vulnerabilities</b>",
         "tech":          "💻 <b>Global Tech News</b>",
@@ -303,18 +425,27 @@ def build_telegram_summary(sections: dict, telegraph_url: str, date_str: str) ->
         "india":         "🇮🇳 <b>India &amp; Kerala</b>",
     }
     lines = ["📰 <b>Morning Briefing</b>", f"<i>{date_str}</i>", "━━━━━━━━━━━━━━━━━━━━━━", ""]
+
     for key, items in sections.items():
         if not items:
             continue
         lines.append(HEADERS.get(key, f"<b>{escape_html(key)}</b>"))
         for item in items:
-            headline = escape_html(item.get("headline", "Untitled"))
-            url      = item.get("url", "")
-            severity = item.get("severity", "")
-            sev_tag  = f" <code>{escape_html(severity)}</code>" if severity else ""
-            lines.append(f"  • <a href='{url}'>{headline}</a>{sev_tag}" if url else f"  • {headline}{sev_tag}")
+            headline  = escape_html(item.get("headline", "Untitled"))
+            tele_url  = item.get("telegraph_url", item.get("url", ""))
+            severity  = item.get("severity", "")
+            sev_tag   = f" <code>{escape_html(severity)}</code>" if severity else ""
+            # Link goes to telegra.ph page → Instant View in Telegram
+            lines.append(
+                f"  • <a href='{tele_url}'>{headline}</a>{sev_tag}" if tele_url
+                else f"  • {headline}{sev_tag}"
+            )
         lines.append("")
-    lines += ["━━━━━━━━━━━━━━━━━━━━━━", f"📖 <a href='{telegraph_url}'><b>Full briefing on Telegraph →</b></a>"]
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📖 <a href='{main_telegraph_url}'><b>Full briefing on Telegraph →</b></a>",
+    ]
     return "\n".join(lines)
 
 
@@ -330,6 +461,16 @@ def main():
     print(f"  📰 Morning Briefing — {date_str}")
     print(f"{'='*52}\n")
 
+    SECTION_LABELS = {
+        "security":      "🔐 Security & Vulnerabilities",
+        "tech":          "💻 Global Tech News",
+        "world":         "🌍 World Politics",
+        "grc":           "📋 GRC & Compliance",
+        "entertainment": "🎬 Entertainment",
+        "india":         "🇮🇳 India & Kerala",
+    }
+
+    # Step 1 — Fetch and curate all sections
     sections      = {}
     section_order = ["security", "tech", "world", "grc", "entertainment", "india"]
 
@@ -347,20 +488,34 @@ def main():
         items = curate_with_groq(section, articles, date_str)
         sections[section] = items
         print(f"   ✅ {len(items)} items selected\n")
-
-        # Wait 12s between Groq calls — stays well within 6000 TPM/min free limit
-        time.sleep(12)
+        time.sleep(12)   # respect Groq 6000 TPM/min free limit
 
     total = sum(len(v) for v in sections.values())
     print(f"✅ Research complete — {total} items\n")
 
-    print("📡 Publishing to Telegraph...")
-    token         = get_telegraph_token()
-    nodes         = build_telegraph_nodes(sections, date_str)
-    telegraph_url = publish_to_telegraph(token, f"Morning Briefing — {date_str}", nodes)
-    print(f"✅ Published: {telegraph_url}\n")
+    # Step 2 — Publish each article as its own Telegraph page (= Instant View)
+    print("📡 Publishing individual article pages to Telegraph...")
+    token = get_telegraph_token()
 
-    summary = build_telegram_summary(sections, telegraph_url, date_str)
+    for section, items in sections.items():
+        label = SECTION_LABELS.get(section, section)
+        for item in items:
+            try:
+                tele_url = publish_article_to_telegraph(token, item, label)
+                item["telegraph_url"] = tele_url
+                print(f"   ✅ {item['headline'][:50]}...")
+                time.sleep(0.5)   # be gentle with Telegraph API
+            except Exception as e:
+                print(f"   ⚠️  Failed to publish article: {e}")
+                item["telegraph_url"] = item.get("url", "")   # fallback to original
+
+    # Step 3 — Publish main briefing page (links to individual Telegraph pages)
+    print("\n📡 Publishing main briefing page...")
+    main_url = build_main_telegraph_page(sections, date_str, token)
+    print(f"✅ Main page: {main_url}\n")
+
+    # Step 4 — Send Telegram summary
+    summary = build_telegram_summary(sections, main_url, date_str)
     print(f"📨 Sending to Telegram...")
     send_telegram(summary)
 
