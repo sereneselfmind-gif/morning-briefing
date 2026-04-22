@@ -326,8 +326,11 @@ if (tg) {
 }
 
 // ── Config — injected at build time by GitHub Actions ────────────
-// Replace GIST_RAW_URL_PLACEHOLDER with the actual URL in briefing.yml
-const GIST_RAW_URL = "GIST_RAW_URL_PLACEHOLDER";
+// Gist URL injected by GitHub Actions workflow
+const GIST_ID     = "9b6fa7cef032351141a088a70702b4ee";
+  // Use GitHub Gist API — proper CORS support for Web App context
+  const GIST_RAW_URL = `https://gist.githubusercontent.com/sereneselfmind-gif/9b6fa7cef032351141a088a70702b4ee/raw/morning_briefing_archive.json`;
+  const GIST_API_URL = `https://api.github.com/gists/9b6fa7cef032351141a088a70702b4ee`;
 
 // ── Section metadata ─────────────────────────────────────────────
 const SECTIONS = {
@@ -347,14 +350,39 @@ let activeSection = "politics";
 // ── Load archive ──────────────────────────────────────────────────
 async function loadArchive() {
   try {
-    const resp = await fetch(GIST_RAW_URL + "?t=" + Date.now());
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    archive     = await resp.json();
-    sortedDates = Object.keys(archive).sort().reverse(); // newest first
-    if (sortedDates.length === 0) throw new Error("Empty archive");
+    let data = null;
+
+    // Try 1: Raw gist URL
+    try {
+      const r1 = await fetch(GIST_RAW_URL, { cache: "no-store" });
+      if (r1.ok) {
+        data = await r1.json();
+      }
+    } catch(_) {}
+
+    // Try 2: GitHub Gist API (better CORS, works in Web App context)
+    if (!data) {
+      const r2 = await fetch(GIST_API_URL, {
+        headers: { "Accept": "application/vnd.github.v3+json" }
+      });
+      if (r2.ok) {
+        const gist     = await r2.json();
+        const fileContent = gist.files["morning_briefing_archive.json"]?.content;
+        if (fileContent) data = JSON.parse(fileContent);
+      } else {
+        throw new Error(`Could not load briefing (HTTP ${r2.status})`);
+      }
+    }
+
+    if (!data) throw new Error("No briefing data found");
+
+    archive        = data;
+    sortedDates    = Object.keys(archive).sort().reverse();
+    if (sortedDates.length === 0) throw new Error("Archive is empty");
     currentDateIdx = 0;
     renderArchiveStrip();
     renderBriefing();
+
   } catch (e) {
     showError(e.message);
   }
