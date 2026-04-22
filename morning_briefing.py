@@ -1,40 +1,37 @@
 #!/usr/bin/env python3
 """
-Morning Briefing Bot — Beautiful Newsletter Edition
-- NewsData.io free tier    → real current news with article images
-- Groq Llama 3.3 70B free  → high quality curation and summaries
-- Telegraph                → beautiful newsletter landing page + per-article Instant View pages
-- Telegram                 → clean HTML summary, all links open as Instant View
+Morning Briefing Bot — GitHub Actions Edition
+- RSS feeds + Google News  → quality news from top sources
+- Groq Llama 3.3 70B       → intelligent curation and rich summaries
+- Telegraph                → beautiful newsletter + per-article Instant View
+- Telegram                 → clean summary, all links open as Instant View
 """
 
 import os
+import re
 import json
 import time
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
+from html import unescape
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "326734657")
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
-NEWSDATA_API_KEY   = os.environ.get("NEWSDATA_API_KEY", "")
 TOKEN_CACHE_FILE   = Path.home() / ".telegraph_token.json"
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL    = "llama-3.3-70b-versatile"   # better quality, 1000 req/day free
+GROQ_MODEL    = "llama-3.3-70b-versatile"
 
-# ── Category default images (Wikimedia Commons direct URLs) ───────────────────
-# These are stable, freely licensed images used when no article image is found
-DEFAULT_IMAGES = {
-    "security":      "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b0/Lock-icon-hi.png/240px-Lock-icon-hi.png",
-    "tech":          "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c3/Python-logo-notext.svg/240px-Python-logo-notext.svg.png",
-    "world":         "https://upload.wikimedia.org/wikipedia/commons/thumb/8/80/UN_emblem_blue.svg/240px-UN_emblem_blue.svg.png",
-    "grc":           "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Balance_of_justice.png/240px-Balance_of_justice.png",
-    "entertainment": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/00/Clapperboard.svg/240px-Clapperboard.svg.png",
-    "india":         "https://upload.wikimedia.org/wikipedia/commons/thumb/4/41/Flag_of_India.svg/320px-Flag_of_India.svg.png",
+RSS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "Chrome/122.0 Safari/537.36 MorningBriefBot/2.0"
 }
 
+# ── Section metadata ──────────────────────────────────────────────────────────
 SECTION_META = {
     "security":      ("🔐", "Security & Vulnerabilities",  "Threats, CVEs and patches for your devices."),
     "tech":          ("💻", "Global Tech News",             "Under-reported developments in AI, hardware and open source."),
@@ -51,11 +48,182 @@ SEVERITY_LABELS = {
     "Low":      "🟢 LOW — Informational",
 }
 
+SEVERITY_EMOJI = {
+    "Critical": "🔴",
+    "High":     "🟠",
+    "Medium":   "🟡",
+    "Low":      "🟢",
+}
 
-# ── Groq API ──────────────────────────────────────────────────────────────────
+DEFAULT_IMAGES = {
+    "security":      "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b0/Lock-icon-hi.png/240px-Lock-icon-hi.png",
+    "tech":          "https://upload.wikimedia.org/wikipedia/commons/thumb/c/cb/Computer_screen_with_a_terminal_emulator_-_Noun_Project.svg/240px-Computer_screen_with_a_terminal_emulator_-_Noun_Project.svg.png",
+    "world":         "https://upload.wikimedia.org/wikipedia/commons/thumb/8/80/UN_emblem_blue.svg/240px-UN_emblem_blue.svg.png",
+    "grc":           "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Balance_of_justice.png/240px-Balance_of_justice.png",
+    "entertainment": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/00/Clapperboard.svg/240px-Clapperboard.svg.png",
+    "india":         "https://upload.wikimedia.org/wikipedia/commons/thumb/4/41/Flag_of_India.svg/320px-Flag_of_India.svg.png",
+}
+
+SECTION_INSTRUCTIONS = {
+    "security":      "Focus on CVEs and active threats for macOS Tahoe (Apple M2) and Android 16 (Vivo X300 Pro). Include severity (Critical/High/Medium/Low) and patch status in detail.",
+    "tech":          "Under-reported global tech stories only. AI policy, open source projects, hardware, cybersecurity incidents. No PR fluff or product marketing.",
+    "world":         "Geopolitical stories not on mainstream front pages. Conflicts, diplomacy, elections, sanctions, trade disputes.",
+    "grc":           "Regulatory updates: ISO, NIST, CERT-In, India DPDP Act, GDPR enforcement actions, compliance fines and deadlines.",
+    "entertainment": "OTT releases, Malayalam and Indian cinema news, global film festivals, music releases. No celebrity personal gossip.",
+    "india":         "Top Kerala and India general news not already covered in security, tech, world, grc, or entertainment.",
+}
+
+# ── RSS Feed Sources ──────────────────────────────────────────────────────────
+SECTION_FEEDS = {
+    "security": {
+        "rss": [
+            "https://www.bleepingcomputer.com/feed/",
+            "https://feeds.feedburner.com/TheHackersNews",
+            "https://www.darkreading.com/rss.xml",
+            "https://feeds.feedburner.com/securityweek",
+        ],
+        "google": "https://news.google.com/rss/search?q=CVE+vulnerability+security+patch&hl=en&gl=US&ceid=US:en",
+    },
+    "tech": {
+        "rss": [
+            "https://hnrss.org/frontpage",
+            "https://feeds.arstechnica.com/arstechnica/index",
+            "https://www.theregister.com/headlines.atom",
+            "https://feeds.feedburner.com/TechCrunch",
+        ],
+        "google": "https://news.google.com/rss/search?q=AI+open+source+tech+policy&hl=en&gl=US&ceid=US:en",
+    },
+    "world": {
+        "rss": [
+            "https://feeds.bbci.co.uk/news/world/rss.xml",
+            "https://rss.dw.com/rss/en-world",
+            "https://www.aljazeera.com/xml/rss/all.xml",
+            "https://feeds.feedburner.com/ndtvnews-world",
+        ],
+        "google": "https://news.google.com/rss/search?q=geopolitical+conflict+diplomacy+election&hl=en&gl=US&ceid=US:en",
+    },
+    "grc": {
+        "rss": [
+            "https://www.iapp.org/feed/",
+            "https://feeds.feedburner.com/securityweek",
+        ],
+        "google": "https://news.google.com/rss/search?q=GDPR+DPDP+NIST+compliance+regulation+enforcement&hl=en&gl=US&ceid=US:en",
+    },
+    "entertainment": {
+        "rss": [
+            "https://feeds.feedburner.com/ndtvnews-movies",
+            "https://variety.com/feed/",
+            "https://deadline.com/feed/",
+        ],
+        "google": "https://news.google.com/rss/search?q=Malayalam+cinema+OTT+release+Bollywood&hl=en-IN&gl=IN&ceid=IN:en",
+    },
+    "india": {
+        "rss": [
+            "https://www.thehindu.com/feeder/default.rss",
+            "https://feeds.feedburner.com/ndtvnews-top-stories",
+            "https://english.mathrubhumi.com/rss",
+        ],
+        "google": "https://news.google.com/rss/search?q=Kerala+India+news&hl=en-IN&gl=IN&ceid=IN:en",
+    },
+}
+
+
+# ── RSS Fetching ──────────────────────────────────────────────────────────────
+
+def clean_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text or "")
+    return unescape(text).strip()
+
+
+def parse_feed(url: str) -> list:
+    """Parse RSS/Atom feed, silently skip on any error."""
+    try:
+        for hdrs in [RSS_HEADERS, {"User-Agent": "python-requests/2.31.0"}]:
+            try:
+                resp = requests.get(url, headers=hdrs, timeout=12, allow_redirects=True)
+                if resp.ok:
+                    break
+            except requests.exceptions.ConnectionError:
+                continue
+        else:
+            return []
+
+        if not resp.ok:
+            return []
+
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError:
+            return []
+
+        ns       = {"atom": "http://www.w3.org/2005/Atom",
+                    "media": "http://search.yahoo.com/mrss/"}
+        articles = []
+
+        # RSS format
+        for item in root.findall(".//item"):
+            title = clean_html(item.findtext("title", ""))
+            link  = (item.findtext("link") or "").strip()
+            image = ""
+            media = item.find("media:content", ns)
+            if media is not None:
+                image = media.get("url", "")
+            enc = item.find("enclosure")
+            if not image and enc is not None and "image" in enc.get("type", ""):
+                image = enc.get("url", "")
+            if title and link:
+                articles.append({"title": title[:150], "url": link, "image": image})
+
+        # Atom format
+        if not articles:
+            for entry in root.findall("atom:entry", ns):
+                title   = clean_html(entry.findtext("atom:title", "", ns))
+                link_el = entry.find("atom:link", ns)
+                link    = link_el.get("href", "") if link_el is not None else ""
+                if title and link:
+                    articles.append({"title": title[:150], "url": link, "image": ""})
+
+        return articles
+
+    except Exception:
+        return []
+
+
+def fetch_section_news(section: str) -> list:
+    """Fetch and deduplicate articles from all sources for a section."""
+    feeds        = SECTION_FEEDS.get(section, {})
+    all_articles = []
+    seen_urls    = set()
+
+    for feed_url in feeds.get("rss", []):
+        articles = parse_feed(feed_url)
+        added = 0
+        for a in articles:
+            if a["url"] not in seen_urls:
+                seen_urls.add(a["url"])
+                all_articles.append(a)
+                added += 1
+        if added:
+            print(f"      ✅ {added} articles — {feed_url[:55]}")
+
+    gnews = feeds.get("google", "")
+    if gnews:
+        articles = parse_feed(gnews)
+        added = 0
+        for a in articles:
+            if a["url"] not in seen_urls:
+                seen_urls.add(a["url"])
+                all_articles.append(a)
+                added += 1
+        if added:
+            print(f"      ✅ {added} articles — Google News RSS")
+
+    return all_articles[:25]
+
+
+# ── Groq curation ─────────────────────────────────────────────────────────────
 
 def call_groq(prompt: str, retries: int = 3) -> str:
-    """Call Groq Llama 3.3 70B with auto-retry on 429."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type":  "application/json",
@@ -65,31 +233,30 @@ def call_groq(prompt: str, retries: int = 3) -> str:
         "messages": [
             {
                 "role":    "system",
-                "content": "You are a precise intelligence briefing assistant. Always return valid JSON exactly as instructed. No markdown fences, no explanation, no preamble — pure JSON only."
+                "content": "You are a precise intelligence briefing assistant. Always return valid JSON exactly as instructed. No markdown fences, no explanation, no preamble."
             },
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.2,
-        "max_tokens":  1024,
+        "max_tokens":  1200,
     }
     for attempt in range(retries):
         resp = requests.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=60)
         if resp.status_code == 429:
             wait = 15 * (attempt + 1)
-            print(f"   ⏳ Rate limited — waiting {wait}s (retry {attempt+1}/{retries})...")
+            print(f"   ⏳ Rate limited — waiting {wait}s...")
             time.sleep(wait)
             continue
         if not resp.ok:
-            raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:500]}")
+            raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:400]}")
         try:
             return resp.json()["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError) as e:
             raise RuntimeError(f"Unexpected Groq response: {e}")
-    raise RuntimeError(f"Groq still rate-limited after {retries} retries")
+    raise RuntimeError(f"Groq rate-limited after {retries} retries")
 
 
 def parse_json_response(raw: str) -> list:
-    """Safely extract a JSON array from Groq response."""
     text = raw.strip()
     if "```" in text:
         text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
@@ -100,89 +267,46 @@ def parse_json_response(raw: str) -> list:
     return json.loads(text)
 
 
-# ── NewsData.io ───────────────────────────────────────────────────────────────
-
-SECTION_QUERIES = {
-    "security":      {"q": "vulnerability security CVE patch exploit malware",                        "language": "en"},
-    "tech":          {"q": "artificial intelligence open source cybersecurity hardware technology",    "language": "en"},
-    "world":         {"q": "war conflict election diplomacy geopolitical sanctions",                   "language": "en"},
-    "grc":           {"q": "GDPR compliance regulation privacy enforcement data protection DPDP",      "language": "en"},
-    "entertainment": {"q": "film cinema OTT streaming music release festival Malayalam Bollywood",     "language": "en"},
-    "india":         {"q": "India Kerala", "country": "in",                                           "language": "en"},
-}
-
-SECTION_INSTRUCTIONS = {
-    "security":      "Focus on CVEs and security threats for macOS Tahoe (Apple M2) and Android 16 (Vivo X300 Pro). Include severity and patch status in detail.",
-    "tech":          "Under-reported global tech only. AI policy, open source, hardware, cybersecurity incidents. No PR fluff.",
-    "world":         "Geopolitical stories not on mainstream front pages. Conflicts, diplomacy, elections, sanctions.",
-    "grc":           "Regulatory updates: ISO, NIST, CERT-In, India DPDP Act, GDPR enforcement, fines.",
-    "entertainment": "OTT releases, Malayalam and Indian cinema, global film festivals, music. No celebrity gossip.",
-    "india":         "Top Kerala and India general news not covered in the other sections.",
-}
-
-
-def fetch_news(section: str) -> list:
-    """Fetch articles from NewsData.io including image URLs."""
-    params = {"apikey": NEWSDATA_API_KEY, "size": 10, **SECTION_QUERIES[section]}
-    resp   = requests.get("https://newsdata.io/api/1/latest", params=params, timeout=15)
-    if not resp.ok:
-        print(f"   ⚠️  NewsData [{resp.status_code}]: {resp.text[:200]}")
-        return []
-    body = resp.json()
-    if body.get("status") != "success":
-        print(f"   ⚠️  NewsData non-success: {str(body)[:200]}")
-        return []
-    articles = body.get("results", [])
-    print(f"   → {len(articles)} raw articles from API")
-    return [
-        {
-            "title": (a.get("title") or "").strip()[:150],
-            "url":   a.get("link", ""),
-            "image": a.get("image_url") or "",     # may be empty — handled with defaults
-        }
-        for a in articles
-        if a.get("title") and a.get("link")
-    ]
-
-
 def curate_with_groq(section: str, articles: list, date_str: str) -> list:
-    """Ask Groq Llama 3.3 70B to pick best 5 and write rich summaries."""
-    needs_severity = (section == "security")
-    sev_field      = ', "severity": "High"' if needs_severity else ""
-    sev_note       = 'Add "severity": Critical/High/Medium/Low per item.' if needs_severity else ""
+    needs_sev = (section == "security")
+    sev_field = ', "severity": "High"' if needs_sev else ""
+    sev_note  = "Add severity: Critical/High/Medium/Low per item." if needs_sev else ""
 
-    articles_text = "\n".join(f"{i+1}. {a['title']} | {a['url']}" for i, a in enumerate(articles))
+    articles_text = "\n".join(
+        f"{i+1}. {a['title']} | {a['url']}"
+        for i, a in enumerate(articles)
+    )
 
-    prompt = f"""Date: {date_str}. Briefing section: {section.upper()}.
+    prompt = f"""Date: {date_str}. Section: {section.upper()}.
 Instruction: {SECTION_INSTRUCTIONS[section]}
 {sev_note}
 
-Articles to choose from:
+Articles:
 {articles_text}
 
-Select exactly 5. For each write:
-- headline: punchy, under 12 words
-- summary: 2 rich sentences of context and significance (NOT just the headline repeated)
+Select exactly 5 most relevant. For each:
+- headline: punchy and specific, under 12 words
+- summary: exactly 2 sentences — what happened and why it matters
 - url: copy exactly from above
-{f'- severity: one of Critical/High/Medium/Low' if needs_severity else ''}
+{f'- severity: Critical/High/Medium/Low' if needs_sev else ''}
 
-Return ONLY a JSON array:
+Return ONLY a valid JSON array:
 [{{"headline":"...","url":"https://...","summary":"..."{sev_field}}},...]"""
 
     raw = call_groq(prompt)
     try:
         items = parse_json_response(raw)
-        # normalise: map summary → detail for compatibility
         for item in items:
             if "summary" in item and "detail" not in item:
                 item["detail"] = item.pop("summary")
         return items[:5]
     except Exception as e:
         print(f"   ⚠️  Parse error for '{section}': {e}")
-        return [{"headline": a["title"][:80], "url": a["url"], "detail": "", "image": a.get("image","")} for a in articles[:5]]
+        return [{"headline": a["title"][:80], "url": a["url"], "detail": ""}
+                for a in articles[:5]]
 
 
-# ── Telegraph helpers ─────────────────────────────────────────────────────────
+# ── Telegraph ─────────────────────────────────────────────────────────────────
 
 def get_telegraph_token() -> str:
     if TOKEN_CACHE_FILE.exists():
@@ -192,21 +316,22 @@ def get_telegraph_token() -> str:
     print("🔧 Creating Telegraph account...")
     resp = requests.post("https://api.telegra.ph/createAccount", json={
         "short_name": "MorningBrief", "author_name": "Morning Briefing Bot"
-    }, timeout=10)
+    }, timeout=15)
     resp.raise_for_status()
     result = resp.json()
     if not result.get("ok"):
         raise RuntimeError(f"Telegraph createAccount failed: {result}")
     token = result["result"]["access_token"]
     TOKEN_CACHE_FILE.write_text(json.dumps({"access_token": token}))
-    print(f"✅ Telegraph token cached at {TOKEN_CACHE_FILE}")
+    print(f"✅ Telegraph token cached")
     return token
 
 
 def publish_to_telegraph(token: str, title: str, nodes: list) -> str:
     resp = requests.post("https://api.telegra.ph/createPage", json={
         "access_token": token, "title": title,
-        "author_name": "Morning Briefing", "content": nodes, "return_content": False,
+        "author_name": "Morning Briefing",
+        "content": nodes, "return_content": False,
     }, timeout=15)
     resp.raise_for_status()
     result = resp.json()
@@ -216,15 +341,11 @@ def publish_to_telegraph(token: str, title: str, nodes: list) -> str:
 
 
 def img_node(url: str) -> dict:
-    """Return a Telegraph image node."""
     return {"tag": "img", "attrs": {"src": url}}
 
 
 def publish_article_page(token: str, item: dict, section: str, main_url: str) -> str:
-    """
-    Beautiful individual article Instant View page.
-    Layout: image → section tag → severity → rich summary → source link → back link
-    """
+    """Beautiful individual article Instant View page."""
     emoji, label, _ = SECTION_META.get(section, ("📌", section, ""))
     headline = item.get("headline", "Untitled")
     detail   = item.get("detail", "")
@@ -234,32 +355,26 @@ def publish_article_page(token: str, item: dict, section: str, main_url: str) ->
 
     nodes = []
 
-    # Hero image
     if image:
         nodes.append(img_node(image))
 
-    # Section tag
     nodes.append({"tag": "p", "children": [
         {"tag": "em", "children": [f"{emoji}  Morning Briefing  ·  {label}"]}
     ]})
-
     nodes.append({"tag": "p", "children": ["▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"]})
 
-    # Severity badge
     if severity:
         nodes.append({"tag": "p", "children": [
             {"tag": "b", "children": [SEVERITY_LABELS.get(severity, severity)]}
         ]})
         nodes.append({"tag": "p", "children": [" "]})
 
-    # Rich summary as blockquote
     if detail:
         nodes.append({"tag": "blockquote", "children": [detail]})
         nodes.append({"tag": "p", "children": [" "]})
 
     nodes.append({"tag": "p", "children": ["▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"]})
 
-    # Source link
     if src_url:
         nodes.append({"tag": "p", "children": [
             "📰  ",
@@ -268,7 +383,6 @@ def publish_article_page(token: str, item: dict, section: str, main_url: str) ->
 
     nodes.append({"tag": "p", "children": [" "]})
 
-    # Back to main briefing link
     if main_url:
         nodes.append({"tag": "p", "children": [
             "← ",
@@ -277,21 +391,17 @@ def publish_article_page(token: str, item: dict, section: str, main_url: str) ->
 
     nodes.append({"tag": "p", "children": [" "]})
     nodes.append({"tag": "p", "children": [
-        {"tag": "em", "children": ["Morning Briefing · Powered by Groq Llama 3.3 70B + NewsData.io"]}
+        {"tag": "em", "children": ["Morning Briefing · Groq Llama 3.3 70B · RSS + Google News"]}
     ]})
 
     return publish_to_telegraph(token, headline, nodes)
 
 
 def publish_main_newsletter(token: str, sections: dict, date_str: str) -> str:
-    """
-    Beautiful newsletter-style landing page.
-    Layout: masthead → table of contents → section cards with images → footer
-    All article links go to individual Telegraph Instant View pages.
-    """
+    """Beautiful newsletter landing page."""
     nodes = []
 
-    # ── Masthead ──────────────────────────────────────────────────────────────
+    # Masthead
     nodes.append({"tag": "p", "children": [
         {"tag": "b", "children": ["📰  MORNING BRIEFING"]}
     ]})
@@ -299,56 +409,47 @@ def publish_main_newsletter(token: str, sections: dict, date_str: str) -> str:
         {"tag": "em", "children": [f"📅  {date_str}"]}
     ]})
     nodes.append({"tag": "p", "children": [
-        "Your daily intelligence digest — curated and summarised."
+        "Your daily intelligence digest — curated from top sources worldwide."
     ]})
     nodes.append({"tag": "p", "children": ["▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"]})
     nodes.append({"tag": "p", "children": [" "]})
 
-    # ── Table of Contents ─────────────────────────────────────────────────────
+    # Table of contents
     nodes.append({"tag": "p", "children": [{"tag": "b", "children": ["In today's briefing:"]}]})
     for key, items in sections.items():
         if not items:
             continue
-        emoji, label, _ = SECTION_META.get(key, ("📌", key, ""))
-        count = len(items)
-        nodes.append({"tag": "p", "children": [f"  {emoji}  {label}  ·  {count} stories"]})
+        emoji, label, _ = SECTION_META[key]
+        nodes.append({"tag": "p", "children": [f"  {emoji}  {label}  ·  {len(items)} stories"]})
     nodes.append({"tag": "p", "children": [" "]})
     nodes.append({"tag": "p", "children": ["▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"]})
     nodes.append({"tag": "p", "children": [" "]})
 
-    # ── Sections ──────────────────────────────────────────────────────────────
+    # Section cards
     for key, items in sections.items():
         if not items:
             continue
+        emoji, label, intro = SECTION_META[key]
 
-        emoji, label, intro = SECTION_META.get(key, ("📌", key, ""))
-
-        # Section header
         nodes.append({"tag": "h3", "children": [f"{emoji}  {label}"]})
-
-        # Section intro
         nodes.append({"tag": "p", "children": [{"tag": "em", "children": [intro]}]})
         nodes.append({"tag": "p", "children": [" "]})
 
-        # Article cards
         for item in items:
-            headline  = item.get("headline", "Untitled")
-            detail    = item.get("detail", "")
-            severity  = item.get("severity", "")
-            tele_url  = item.get("telegraph_url", item.get("url", ""))
-            image     = item.get("image", "") or DEFAULT_IMAGES.get(key, "")
+            headline = item.get("headline", "Untitled")
+            detail   = item.get("detail", "")
+            severity = item.get("severity", "")
+            tele_url = item.get("telegraph_url", item.get("url", ""))
+            image    = item.get("image", "") or DEFAULT_IMAGES.get(key, "")
 
-            # Article image
             if image:
                 nodes.append(img_node(image))
 
-            # Severity badge
             if severity:
                 nodes.append({"tag": "p", "children": [
                     {"tag": "b", "children": [SEVERITY_LABELS.get(severity, severity)]}
                 ]})
 
-            # Headline as bold link → individual Telegraph page
             if tele_url:
                 nodes.append({"tag": "p", "children": [
                     {"tag": "b", "children": [
@@ -358,23 +459,23 @@ def publish_main_newsletter(token: str, sections: dict, date_str: str) -> str:
             else:
                 nodes.append({"tag": "p", "children": [{"tag": "b", "children": [headline]}]})
 
-            # Summary as blockquote
             if detail:
                 nodes.append({"tag": "blockquote", "children": [detail]})
 
             nodes.append({"tag": "p", "children": [" "]})
 
-        # Section divider
         nodes.append({"tag": "p", "children": ["· · · · · · · · · · · · · · · · · · · · · · · ·"]})
         nodes.append({"tag": "p", "children": [" "]})
 
-    # ── Footer ────────────────────────────────────────────────────────────────
+    # Footer
     nodes.append({"tag": "p", "children": ["▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"]})
     nodes.append({"tag": "p", "children": [
         {"tag": "em", "children": ["Tap any headline to read the full story in Instant View."]}
     ]})
     nodes.append({"tag": "p", "children": [
-        {"tag": "em", "children": [f"Generated automatically · Groq Llama 3.3 70B + NewsData.io · {date_str}"]}
+        {"tag": "em", "children": [
+            f"Sources: BleepingComputer · HackerNews · BBC · Al Jazeera · The Hindu · Mathrubhumi · Google News · {date_str}"
+        ]}
     ]})
 
     return publish_to_telegraph(token, f"📰 Morning Briefing — {date_str}", nodes)
@@ -383,30 +484,24 @@ def publish_main_newsletter(token: str, sections: dict, date_str: str) -> str:
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
 def escape_html(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def send_telegram(text: str):
-    url    = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    chunks = []
-    while len(text) > 4000:
-        split_at = text.rfind("\n", 0, 4000)
-        if split_at == -1:
-            split_at = 4000
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    chunks.append(text)
-    for i, chunk in enumerate(chunks):
-        resp = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID, "text": chunk,
-            "parse_mode": "HTML", "disable_web_page_preview": False,
-        }, timeout=10)
-        print(f"✅ Telegram chunk {i+1}/{len(chunks)} sent" if resp.ok else f"⚠️  Telegram error: {resp.text}")
-        if len(chunks) > 1:
-            time.sleep(0.5)
+def send_telegram(text: str, disable_preview: bool = False):
+    url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    resp = requests.post(url, json={
+        "chat_id":                  TELEGRAM_CHAT_ID,
+        "text":                     text,
+        "parse_mode":               "HTML",
+        "disable_web_page_preview": disable_preview,
+    }, timeout=10)
+    if not resp.ok:
+        print(f"   ⚠️  Telegram error: {resp.text[:200]}")
+    return resp.ok
 
 
 def build_telegram_summary(sections: dict, main_url: str, date_str: str) -> str:
+    """Compact Telegram summary — each bullet links to its Telegraph Instant View."""
     HEADERS = {
         "security":      "🔐 <b>Security &amp; Vulnerabilities</b>",
         "tech":          "💻 <b>Global Tech News</b>",
@@ -415,7 +510,12 @@ def build_telegram_summary(sections: dict, main_url: str, date_str: str) -> str:
         "entertainment": "🎬 <b>Entertainment</b>",
         "india":         "🇮🇳 <b>India &amp; Kerala</b>",
     }
-    lines = ["📰 <b>Morning Briefing</b>", f"<i>{date_str}</i>", "━━━━━━━━━━━━━━━━━━━━━━", ""]
+    lines = [
+        "📰 <b>Morning Briefing</b>",
+        f"<i>{date_str}</i>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
     for key, items in sections.items():
         if not items:
             continue
@@ -424,8 +524,11 @@ def build_telegram_summary(sections: dict, main_url: str, date_str: str) -> str:
             headline = escape_html(item.get("headline", "Untitled"))
             tele_url = item.get("telegraph_url", item.get("url", ""))
             severity = item.get("severity", "")
-            sev_tag  = f" <code>{escape_html(severity)}</code>" if severity else ""
-            lines.append(f"  • <a href='{tele_url}'>{headline}</a>{sev_tag}" if tele_url else f"  • {headline}{sev_tag}")
+            sev_tag  = f" {SEVERITY_EMOJI.get(severity,'')}" if severity else ""
+            lines.append(
+                f"  • <a href='{tele_url}'>{headline}</a>{sev_tag}" if tele_url
+                else f"  • {headline}{sev_tag}"
+            )
         lines.append("")
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━",
@@ -437,11 +540,14 @@ def build_telegram_summary(sections: dict, main_url: str, date_str: str) -> str:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    missing = [v for v in ["TELEGRAM_BOT_TOKEN", "GROQ_API_KEY", "NEWSDATA_API_KEY"] if not os.environ.get(v)]
+    missing = [v for v in ["TELEGRAM_BOT_TOKEN", "GROQ_API_KEY"] if not os.environ.get(v)]
     if missing:
         raise EnvironmentError(f"Missing env vars: {', '.join(missing)}")
 
-    date_str = datetime.now().strftime("%A, %d %B %Y")
+    date_str      = datetime.now().strftime("%A, %d %B %Y")
+    section_order = ["tech", "world", "grc", "entertainment", "india", "security"]
+    display_order = ["security", "tech", "world", "grc", "entertainment", "india"]
+
     print(f"\n{'='*54}")
     print(f"  📰 Morning Briefing — {date_str}")
     print(f"{'='*54}\n")
@@ -449,57 +555,63 @@ def main():
     token = get_telegraph_token()
 
     # Step 1 — Fetch and curate all sections
-    sections      = {}
-    section_order = ["security", "tech", "world", "grc", "entertainment", "india"]
-
+    sections = {}
     for section in section_order:
-        print(f"🔍 [{section.upper()}] Fetching news...")
-        articles = fetch_news(section)
+        print(f"🔍 [{section.upper()}] Fetching from RSS + Google News...")
+        articles = fetch_section_news(section)
+        print(f"   → {len(articles)} unique articles collected")
+
         if not articles:
-            print(f"   ⚠️  No articles, skipping\n")
+            print(f"   ⚠️  No articles found, skipping\n")
             sections[section] = []
             continue
-        print(f"   🤖 Curating with Groq Llama 3.3 70B...")
+
+        print(f"   🤖 Curating top 5 with Groq Llama 3.3 70B...")
         items = curate_with_groq(section, articles, date_str)
-        # Carry over image URLs from raw articles where available
+
+        # Carry over image from raw articles
+        url_to_image = {a["url"]: a.get("image", "") for a in articles}
         for item in items:
-            for art in articles:
-                if art["url"] == item.get("url") and art.get("image"):
-                    item["image"] = art["image"]
-                    break
+            if not item.get("image"):
+                item["image"] = url_to_image.get(item.get("url", ""), "")
+
         sections[section] = items
         print(f"   ✅ {len(items)} items selected\n")
-        time.sleep(12)   # respect Groq TPM limit
+        time.sleep(15)
 
     total = sum(len(v) for v in sections.values())
     print(f"✅ Curation complete — {total} items\n")
 
-    # Step 2 — Publish a placeholder main page first (to get the URL for back links)
-    print("📡 Creating main briefing page placeholder...")
-    placeholder_nodes = [{"tag": "p", "children": ["Loading..."]}]
-    main_url = publish_to_telegraph(token, f"📰 Morning Briefing — {date_str}", placeholder_nodes)
-    print(f"   Main URL: {main_url}\n")
+    # Step 2 — Publish placeholder main page (for back links)
+    print("📡 Creating main page placeholder...")
+    main_url = publish_to_telegraph(
+        token, f"📰 Morning Briefing — {date_str}",
+        [{"tag": "p", "children": ["Loading..."]}]
+    )
+    print(f"   → {main_url}\n")
 
-    # Step 3 — Publish individual article pages (with back link to main)
+    # Step 3 — Publish individual article Instant View pages
     print("📄 Publishing individual article pages...")
-    for section, items in sections.items():
+    for section in display_order:
+        items = sections.get(section, [])
         for item in items:
             try:
                 tele_url = publish_article_page(token, item, section, main_url)
                 item["telegraph_url"] = tele_url
                 print(f"   ✅ {item['headline'][:55]}...")
-                time.sleep(0.6)
+                time.sleep(0.5)
             except Exception as e:
                 print(f"   ⚠️  Article page failed: {e}")
                 item["telegraph_url"] = item.get("url", "")
 
-    # Step 4 — Publish the real beautiful main newsletter page
+    # Step 4 — Publish the real beautiful main newsletter
     print("\n📰 Publishing main newsletter page...")
-    main_url = publish_main_newsletter(token, sections, date_str)
+    ordered_sections = {k: sections.get(k, []) for k in display_order}
+    main_url = publish_main_newsletter(token, ordered_sections, date_str)
     print(f"✅ Newsletter: {main_url}\n")
 
     # Step 5 — Send Telegram summary
-    summary = build_telegram_summary(sections, main_url, date_str)
+    summary = build_telegram_summary(ordered_sections, main_url, date_str)
     print("📨 Sending to Telegram...")
     send_telegram(summary)
 
