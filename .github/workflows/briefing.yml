@@ -3,7 +3,7 @@ name: Morning Briefing
 on:
   schedule:
     - cron: '30 22 * * *'   # 4:00 AM IST = 22:30 UTC
-  workflow_dispatch:          # manual trigger anytime
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -11,7 +11,7 @@ env:
 jobs:
   send-briefing:
     runs-on: ubuntu-latest
-    timeout-minutes: 15       # script takes ~5 mins due to Groq rate limit waits
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -26,8 +26,30 @@ jobs:
         run: pip install requests
 
       - name: Run morning briefing
+        id: briefing
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GROQ_API_KEY:       ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_TOKEN:         ${{ secrets.GIST_TOKEN }}
+          GIST_ID:            ${{ secrets.GIST_ID }}
+          GH_USERNAME:    ${{ secrets.GH_USERNAME }}
+          REPO_NAME:          morning-briefing
         run: python morning_briefing.py
+
+      - name: Inject Gist URL into Web App
+        env:
+          GIST_ID:         ${{ secrets.GIST_ID }}
+          GH_USERNAME: ${{ secrets.GH_USERNAME }}
+        run: |
+          GIST_URL="https://gist.githubusercontent.com/${GH_USERNAME}/${GIST_ID}/raw/morning_briefing_archive.json"
+          sed -i "s|GIST_RAW_URL_PLACEHOLDER|${GIST_URL}|g" index.html
+          echo "✅ Injected Gist URL: $GIST_URL"
+
+      - name: Deploy Web App to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./
+          publish_branch: gh-pages
+          include_files: index.html
