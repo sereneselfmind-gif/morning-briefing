@@ -29,5 +29,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          NEWSDATA_API_KEY:   ${{ secrets.NEWSDATA_API_KEY }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python morning_briefing.py
