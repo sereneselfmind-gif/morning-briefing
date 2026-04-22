@@ -169,7 +169,7 @@ def fetch_section_articles(section_key: str) -> list:
             domain = feed_url.split("/")[2][:40]
             print(f"      ✅ {added:2d} — {domain}")
     print(f"      → {len(all_articles)} total unique articles")
-    return all_articles[:15]
+    return all_articles[:10]   # cap at 10 to stay within Groq TPM limit
 
 
 # ── Groq curation ─────────────────────────────────────────────────────────────
@@ -195,7 +195,7 @@ def call_groq(prompt: str, retries: int = 3) -> str:
         resp = requests.post(GROQ_ENDPOINT, headers=headers,
                              json=payload, timeout=60)
         if resp.status_code == 429:
-            wait = 15 * (attempt + 1)
+            wait = 30 * (attempt + 1)   # 30s, 60s, 90s
             print(f"   ⏳ Rate limited — waiting {wait}s...")
             time.sleep(wait)
             continue
@@ -413,7 +413,7 @@ def main():
         items = curate_top5(key, articles, date_str)
         sections_data[key] = items
         print(f"   ✅ {len(items)} items curated")
-        time.sleep(15)
+        time.sleep(20)
 
     total = sum(len(v) for v in sections_data.values())
     print(f"\n✅ Curation complete — {total} items\n")
