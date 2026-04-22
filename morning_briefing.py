@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Morning Briefing Bot — 100% Free Edition
-- NewsData.io free tier  → fetches real current news (200 req/day free)
-- Gemini 2.0 Flash free  → summarises and formats each section
-- Telegraph              → publishes full briefing as a beautiful page
-- Telegram               → sends clean HTML summary
+Morning Briefing Bot — Groq + NewsData.io Edition (100% Free)
+- NewsData.io free tier   → fetches real current news (200 req/day free)
+- Groq free tier (Llama)  → picks top 5 and formats each section
+- Telegraph               → publishes full beautiful briefing page
+- Telegram                → sends clean HTML summary with Telegraph link
 """
 
 import os
@@ -17,40 +17,72 @@ from pathlib import Path
 # ── Configuration ─────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "326734657")
-GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 NEWSDATA_API_KEY   = os.environ.get("NEWSDATA_API_KEY", "")
 TOKEN_CACHE_FILE   = Path.home() / ".telegraph_token.json"
 
-GEMINI_ENDPOINT = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash:generateContent"
-)
+# Groq uses OpenAI-compatible API format
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL    = "llama-3.1-8b-instant"   # 14,400 req/day free — most generous
+
+# ── Groq API call ──────────────────────────────────────────────────────────────
+
+def call_groq(prompt: str) -> str:
+    """Call Groq Llama and return the response text."""
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role":    "system",
+                "content": "You are a precise news curation assistant. You always return valid JSON exactly as instructed. No markdown, no explanation, no preamble."
+            },
+            {
+                "role":    "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens":  2048,
+    }
+    resp = requests.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=60)
+    if not resp.ok:
+        raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected Groq response structure: {e}\n{str(data)[:400]}")
+
 
 # ── NewsData.io helpers ────────────────────────────────────────────────────────
 
 SECTION_QUERIES = {
     "security": {
-        "q":        "CVE vulnerability macOS Android security patch",
+        "q":        "CVE vulnerability macOS Android security patch exploit",
         "category": "technology",
         "language": "en",
     },
     "tech": {
-        "q":        "AI policy open source hardware cybersecurity",
+        "q":        "AI policy open source hardware cybersecurity breach",
         "category": "technology",
         "language": "en",
     },
     "world": {
-        "q":        "geopolitical conflict diplomacy election sanctions",
+        "q":        "geopolitical conflict diplomacy election sanctions trade",
         "category": "politics",
         "language": "en",
     },
     "grc": {
-        "q":        "GDPR NIST ISO compliance regulation DPDP CERT-In enforcement",
+        "q":        "GDPR NIST ISO compliance regulation data protection enforcement fine",
         "category": "technology",
         "language": "en",
     },
     "entertainment": {
-        "q":        "OTT Malayalam cinema film festival music release",
+        "q":        "OTT Malayalam cinema film festival music streaming release",
         "category": "entertainment",
         "language": "en",
     },
@@ -63,11 +95,11 @@ SECTION_QUERIES = {
 }
 
 
-def fetch_news(section: str) -> list[dict]:
-    """Fetch top articles from NewsData.io for a section."""
+def fetch_news(section: str) -> list:
+    """Fetch latest articles from NewsData.io for a given section."""
     params = {
-        "apikey":   NEWSDATA_API_KEY,
-        "size":     10,
+        "apikey": NEWSDATA_API_KEY,
+        "size":   10,
         **SECTION_QUERIES[section],
     }
     resp = requests.get(
@@ -76,102 +108,71 @@ def fetch_news(section: str) -> list[dict]:
         timeout=15,
     )
     if not resp.ok:
-        print(f"⚠️  NewsData error for '{section}': {resp.status_code} {resp.text[:200]}")
+        print(f"   ⚠️  NewsData error [{resp.status_code}]: {resp.text[:200]}")
         return []
 
-    data = resp.json()
-    articles = data.get("results", [])
-
-    # Return simplified list for Gemini to process
-    simplified = []
-    for a in articles:
-        simplified.append({
-            "title":       a.get("title", ""),
-            "description": a.get("description", "") or "",
+    articles = resp.json().get("results", [])
+    return [
+        {
+            "title":       a.get("title", "").strip(),
+            "description": (a.get("description") or "").strip()[:300],
             "url":         a.get("link", ""),
             "source":      a.get("source_name", ""),
             "published":   a.get("pubDate", ""),
-        })
-    return simplified
+        }
+        for a in articles
+        if a.get("title") and a.get("link")
+    ]
 
 
-# ── Gemini helpers ─────────────────────────────────────────────────────────────
+# ── Groq curation ──────────────────────────────────────────────────────────────
 
-def call_gemini(prompt: str) -> str:
-    """Call Gemini 2.0 Flash (free tier, no grounding needed) and return text."""
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature":     0.1,
-            "maxOutputTokens": 2048,
-        },
-    }
-    resp = requests.post(
-        GEMINI_ENDPOINT,
-        params={"key": GEMINI_API_KEY},
-        json=payload,
-        timeout=60,
-    )
-    if not resp.ok:
-        raise RuntimeError(
-            f"Gemini API error {resp.status_code}: {resp.text[:500]}"
-        )
-    data = resp.json()
-    try:
-        parts = data["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts).strip()
-    except (KeyError, IndexError) as e:
-        raise RuntimeError(
-            f"Unexpected Gemini response: {e}\n{json.dumps(data)[:400]}"
-        )
+SECTION_INSTRUCTIONS = {
+    "security":      "Focus on CVEs and active security threats for macOS Tahoe (Apple M2) and Android 16. Include severity (Critical/High/Medium/Low) and patch status in the detail field.",
+    "tech":          "Pick under-reported global tech stories only. AI policy, open source, hardware, cybersecurity incidents. Exclude PR fluff and product marketing.",
+    "world":         "Pick geopolitical stories not on mainstream front pages. Emerging conflicts, diplomatic shifts, elections, sanctions, trade disputes.",
+    "grc":           "Pick regulatory and compliance updates: ISO, NIST, CERT-In, India DPDP Act, GDPR enforcement actions, compliance deadlines.",
+    "entertainment": "Pick OTT releases, Malayalam and Indian cinema news, global film festivals, music releases. Exclude celebrity personal gossip.",
+    "india":         "Pick top Kerala and India general news not already covered in security, tech, world, grc, or entertainment sections.",
+}
 
 
-def gemini_pick_top5(section: str, articles: list[dict], date_str: str) -> list[dict]:
-    """Ask Gemini to pick the best 5 articles and return structured JSON."""
+def curate_with_groq(section: str, articles: list, date_str: str) -> list:
+    """Ask Groq to pick the best 5 articles and return structured JSON."""
+    needs_severity = (section == "security")
+    severity_field = ', "severity": "High"' if needs_severity else ""
+    severity_note  = 'Add "severity": Critical/High/Medium/Low based on the article.' if needs_severity else ""
 
-    SECTION_INSTRUCTIONS = {
-        "security":      "Focus on CVEs and threats for macOS Tahoe (Apple M2) and Android 16. Include severity (Critical/High/Medium/Low) and patch status in the detail.",
-        "tech":          "Pick under-reported tech stories only. AI policy, open source, hardware, cybersecurity incidents. No PR fluff or product launches.",
-        "world":         "Pick geopolitical stories NOT on mainstream front pages. Emerging conflicts, diplomacy, elections, sanctions.",
-        "grc":           "Pick regulatory updates: ISO, NIST, CERT-In, DPDP Act, GDPR enforcement actions, compliance deadlines.",
-        "entertainment": "Pick OTT releases, Malayalam/Indian cinema news, global film festivals, music releases. No celebrity gossip.",
-        "india":         "Pick top Kerala and India general news stories not covered in security/tech/world/grc/entertainment.",
-    }
+    articles_json = json.dumps(articles, indent=2)
 
-    needs_severity = section == "security"
-    severity_note  = (
-        'Also add a "severity" field: one of Critical/High/Medium/Low.'
-        if needs_severity else ""
-    )
+    prompt = f"""Today is {date_str}. You are curating the {section.upper()} section of a morning intelligence briefing.
 
-    articles_text = json.dumps(articles, indent=2)
-
-    prompt = f"""Today is {date_str}.
-You are curating a morning intelligence briefing section: {section.upper()}.
 Instructions: {SECTION_INSTRUCTIONS[section]}
 
-Here are raw news articles fetched from a news API:
-{articles_text}
+Raw articles from news API:
+{articles_json}
 
-Your task:
-1. Select exactly 5 of the most relevant and interesting articles
-2. Write a concise headline (under 12 words) for each
-3. Write a one-sentence detail (context, not a repeat of headline)
-4. Use the original article URL exactly as provided
+Task:
+- Select exactly 5 of the most relevant articles from the list above
+- Write a short headline under 12 words
+- Write a one-sentence detail giving context (do NOT repeat the headline)
+- Copy the URL exactly from the article
 {severity_note}
 
-Return ONLY valid JSON, no markdown, no explanation:
+Return ONLY a JSON array, no markdown fences, no explanation:
 [
-  {{"headline": "...", "url": "https://...", "detail": "..."{', "severity": "High"' if needs_severity else ''}}},
-  ...
-]
-(exactly 5 items)"""
+  {{"headline": "...", "url": "https://...", "detail": "..."{severity_field}}},
+  {{"headline": "...", "url": "https://...", "detail": "..."{severity_field}}},
+  {{"headline": "...", "url": "https://...", "detail": "..."{severity_field}}},
+  {{"headline": "...", "url": "https://...", "detail": "..."{severity_field}}},
+  {{"headline": "...", "url": "https://...", "detail": "..."{severity_field}}}
+]"""
 
-    raw  = call_gemini(prompt)
+    raw  = call_groq(prompt)
     text = raw.strip()
 
-    # Strip markdown fences
-    if text.startswith("```"):
+    # Strip accidental markdown fences
+    if "```" in text:
         lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
         text  = "\n".join(lines).strip()
 
@@ -183,25 +184,25 @@ Return ONLY valid JSON, no markdown, no explanation:
 
     try:
         items = json.loads(text)
+        return items[:5]
     except json.JSONDecodeError as e:
-        print(f"⚠️  Gemini JSON error for section '{section}': {e}")
-        print(f"   Raw: {raw[:400]}")
-        # Fallback: return first 5 raw articles as-is
-        items = [
+        print(f"   ⚠️  JSON parse error for '{section}': {e}")
+        print(f"   Raw (first 300 chars): {raw[:300]}")
+        # Graceful fallback — use raw article titles
+        return [
             {
                 "headline": a["title"][:80],
                 "url":      a["url"],
-                "detail":   a["description"][:120] if a["description"] else "",
+                "detail":   a["description"][:150] if a["description"] else "",
             }
             for a in articles[:5]
         ]
-
-    return items[:5]
 
 
 # ── Telegraph helpers ──────────────────────────────────────────────────────────
 
 def get_telegraph_token() -> str:
+    """Return cached Telegraph token or create a new account."""
     if TOKEN_CACHE_FILE.exists():
         data = json.loads(TOKEN_CACHE_FILE.read_text())
         print("✅ Using cached Telegraph token")
@@ -223,6 +224,7 @@ def get_telegraph_token() -> str:
 
 
 def publish_to_telegraph(token: str, title: str, nodes: list) -> str:
+    """Publish a Telegraph page and return its URL."""
     resp = requests.post("https://api.telegra.ph/createPage", json={
         "access_token":  token,
         "title":         title,
@@ -238,7 +240,8 @@ def publish_to_telegraph(token: str, title: str, nodes: list) -> str:
 
 
 def build_telegraph_nodes(sections: dict, date_str: str) -> list:
-    SECTION_META = {
+    """Build Telegraph DOM nodes from section data."""
+    SECTION_LABELS = {
         "security":      "🔐 Security & Vulnerabilities",
         "tech":          "💻 Global Tech News",
         "world":         "🌍 World Politics",
@@ -253,7 +256,9 @@ def build_telegraph_nodes(sections: dict, date_str: str) -> list:
         {"tag": "p", "children": ["─────────────────────────"]},
     ]
     for key, items in sections.items():
-        nodes.append({"tag": "h3", "children": [SECTION_META.get(key, key)]})
+        if not items:
+            continue
+        nodes.append({"tag": "h3", "children": [SECTION_LABELS.get(key, key)]})
         for idx, item in enumerate(items, 1):
             headline = item.get("headline", "Untitled")
             url      = item.get("url", "")
@@ -267,14 +272,13 @@ def build_telegraph_nodes(sections: dict, date_str: str) -> list:
             if detail:
                 children += [f" — {detail}"]
             nodes.append({"tag": "p", "children": children})
-
         nodes.append({"tag": "p", "children": [" "]})
 
     nodes += [
         {"tag": "p", "children": ["─────────────────────────"]},
         {"tag": "p", "children": [
             {"tag": "em", "children": [
-                f"Generated by Morning Briefing Bot (Gemini 2.0 Flash + NewsData.io) • {date_str}"
+                f"Generated by Morning Briefing Bot (Groq Llama + NewsData.io) • {date_str}"
             ]}
         ]},
     ]
@@ -288,6 +292,7 @@ def escape_html(text: str) -> str:
 
 
 def send_telegram(text: str):
+    """Send HTML message to Telegram, splitting if over 4000 chars."""
     url    = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     chunks = []
     while len(text) > 4000:
@@ -305,16 +310,16 @@ def send_telegram(text: str):
             "parse_mode":               "HTML",
             "disable_web_page_preview": True,
         }, timeout=10)
-        print(
-            f"✅ Telegram chunk {i+1}/{len(chunks)} sent"
-            if resp.ok else
-            f"⚠️  Telegram error: {resp.text}"
-        )
+        if resp.ok:
+            print(f"✅ Telegram chunk {i+1}/{len(chunks)} sent")
+        else:
+            print(f"⚠️  Telegram error on chunk {i+1}: {resp.text}")
         if len(chunks) > 1:
             time.sleep(0.5)
 
 
 def build_telegram_summary(sections: dict, telegraph_url: str, date_str: str) -> str:
+    """Build clean HTML summary message for Telegram."""
     HEADERS = {
         "security":      "🔐 <b>Security &amp; Vulnerabilities</b>",
         "tech":          "💻 <b>Global Tech News</b>",
@@ -330,14 +335,18 @@ def build_telegram_summary(sections: dict, telegraph_url: str, date_str: str) ->
         "",
     ]
     for key, items in sections.items():
+        if not items:
+            continue
         lines.append(HEADERS.get(key, f"<b>{escape_html(key)}</b>"))
         for item in items:
             headline = escape_html(item.get("headline", "Untitled"))
             url      = item.get("url", "")
             severity = item.get("severity", "")
             sev_tag  = f" <code>{escape_html(severity)}</code>" if severity else ""
-            line     = f"  • <a href='{url}'>{headline}</a>{sev_tag}" if url else f"  • {headline}{sev_tag}"
-            lines.append(line)
+            lines.append(
+                f"  • <a href='{url}'>{headline}</a>{sev_tag}" if url
+                else f"  • {headline}{sev_tag}"
+            )
         lines.append("")
 
     lines += [
@@ -350,47 +359,50 @@ def build_telegram_summary(sections: dict, telegraph_url: str, date_str: str) ->
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise EnvironmentError("TELEGRAM_BOT_TOKEN is not set")
-    if not GEMINI_API_KEY:
-        raise EnvironmentError("GEMINI_API_KEY is not set")
-    if not NEWSDATA_API_KEY:
-        raise EnvironmentError("NEWSDATA_API_KEY is not set")
+    # Validate required environment variables
+    missing = [v for v in ["TELEGRAM_BOT_TOKEN", "GROQ_API_KEY", "NEWSDATA_API_KEY"] if not os.environ.get(v)]
+    if missing:
+        raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
 
     date_str = datetime.now().strftime("%A, %d %B %Y")
     print(f"\n{'='*52}")
     print(f"  📰 Morning Briefing — {date_str}")
     print(f"{'='*52}\n")
 
-    sections = {}
-    for section in ["security", "tech", "world", "grc", "entertainment", "india"]:
-        print(f"🔍 Fetching news: {section}...")
+    sections      = {}
+    section_order = ["security", "tech", "world", "grc", "entertainment", "india"]
+
+    for section in section_order:
+        print(f"🔍 [{section.upper()}] Fetching news...")
         articles = fetch_news(section)
         print(f"   → {len(articles)} articles fetched")
 
         if not articles:
-            print(f"   ⚠️  No articles for '{section}', skipping")
+            print(f"   ⚠️  No articles found, skipping section\n")
             sections[section] = []
             continue
 
-        print(f"   🤖 Asking Gemini to pick top 5...")
-        items = gemini_pick_top5(section, articles, date_str)
+        print(f"   🤖 Curating with Groq Llama...")
+        items = curate_with_groq(section, articles, date_str)
         sections[section] = items
         print(f"   ✅ {len(items)} items selected\n")
 
-        # Respect Gemini free tier rate limit (15 req/min)
-        time.sleep(4)
+        # Respect Groq free tier: 30 req/min → wait 2s between calls
+        time.sleep(2)
 
+    total = sum(len(v) for v in sections.values())
+    print(f"✅ Research complete — {total} items across {len([s for s in sections if sections[s]])} sections\n")
+
+    # Publish to Telegraph
     print("📡 Publishing to Telegraph...")
     token         = get_telegraph_token()
     nodes         = build_telegraph_nodes(sections, date_str)
-    telegraph_url = publish_to_telegraph(
-        token, f"Morning Briefing — {date_str}", nodes
-    )
+    telegraph_url = publish_to_telegraph(token, f"Morning Briefing — {date_str}", nodes)
     print(f"✅ Published: {telegraph_url}\n")
 
+    # Send to Telegram
     summary = build_telegram_summary(sections, telegraph_url, date_str)
-    print(f"📨 Sending to Telegram...")
+    print(f"📨 Sending to Telegram (chat: {TELEGRAM_CHAT_ID})...")
     send_telegram(summary)
 
     print(f"\n{'='*52}")
