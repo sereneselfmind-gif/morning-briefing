@@ -144,7 +144,7 @@ def parse_feed(url: str) -> list:
             title = clean_html(item.findtext("title", ""))
             link  = (item.findtext("link") or "").strip()
             if title and link and len(title) > 5:
-                articles.append({"title": title[:160], "url": link})
+                articles.append({"title": title[:100], "url": link})
 
         # Atom format
         if not articles:
@@ -153,7 +153,7 @@ def parse_feed(url: str) -> list:
                 link_el = entry.find("atom:link", ns)
                 link    = link_el.get("href", "") if link_el is not None else ""
                 if title and link and len(title) > 5:
-                    articles.append({"title": title[:160], "url": link})
+                    articles.append({"title": title[:100], "url": link})
 
         return articles
 
@@ -180,7 +180,7 @@ def fetch_section_articles(section_key: str) -> list:
             print(f"      ✅ {added:2d} articles — {domain}")
 
     print(f"      → {len(all_articles)} total unique articles")
-    return all_articles[:30]
+    return all_articles[:15]   # cap at 15 to stay within Groq 12k TPM limit
 
 
 # ── Groq curation ─────────────────────────────────────────────────────────────
