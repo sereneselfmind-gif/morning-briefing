@@ -67,34 +67,29 @@ def call_groq(prompt: str, retries: int = 3) -> str:
 # ── NewsData.io helpers ────────────────────────────────────────────────────────
 
 SECTION_QUERIES = {
+    # category filter removed — combining q+category causes 0 results on free tier
     "security": {
-        "q":        "CVE vulnerability macOS Android security patch exploit",
-        "category": "technology",
+        "q":        "vulnerability security CVE patch exploit malware",
         "language": "en",
     },
     "tech": {
-        "q":        "AI policy open source hardware cybersecurity breach",
-        "category": "technology",
+        "q":        "artificial intelligence open source cybersecurity hardware technology",
         "language": "en",
     },
     "world": {
-        "q":        "geopolitical conflict diplomacy election sanctions trade",
-        "category": "politics",
+        "q":        "war conflict election diplomacy geopolitical sanctions",
         "language": "en",
     },
     "grc": {
-        "q":        "GDPR NIST ISO compliance regulation data protection enforcement fine",
-        "category": "technology",
+        "q":        "GDPR compliance regulation privacy enforcement data protection DPDP",
         "language": "en",
     },
     "entertainment": {
-        "q":        "OTT Malayalam cinema film festival music streaming release",
-        "category": "entertainment",
+        "q":        "film cinema OTT streaming music release festival Malayalam Bollywood",
         "language": "en",
     },
     "india": {
-        "q":        "India Kerala news",
-        "category": "top",
+        "q":        "India Kerala",
         "country":  "in",
         "language": "en",
     },
@@ -114,10 +109,15 @@ def fetch_news(section: str) -> list:
         timeout=15,
     )
     if not resp.ok:
-        print(f"   ⚠️  NewsData error [{resp.status_code}]: {resp.text[:200]}")
+        print(f"   ⚠️  NewsData error [{resp.status_code}]: {resp.text[:300]}")
         return []
 
-    articles = resp.json().get("results", [])
+    body     = resp.json()
+    if body.get("status") != "success":
+        print(f"   ⚠️  NewsData non-success: {body.get('results', body)}")
+        return []
+    articles = body.get("results", [])
+    print(f"   → API returned {len(articles)} raw results")
     return [
         {
             "title": a.get("title", "").strip()[:120],   # short title only — keeps tokens low
