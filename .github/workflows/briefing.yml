@@ -2,7 +2,7 @@ name: Morning Briefing
 
 on:
   schedule:
-    - cron: '30 22 * * *'   # 4:00 AM IST = 22:30 UTC
+    - cron: '30 5 * * *'   # 4:00 AM IST = 22:30 UTC
   workflow_dispatch:
 
 env:
